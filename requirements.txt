@@ -8,3 +8,4 @@ networkx
 pyvis
 plotly
 scikit-learn
+opencv-python
