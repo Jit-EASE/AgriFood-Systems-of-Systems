@@ -21,6 +21,15 @@ try:
 except Exception:
     SKIMAGE_OK = False
 
+# NEW: robust OpenCV detection (capture real error for diagnostics)
+HAS_CV2 = True
+CV2_ERR = ""
+try:
+    import cv2
+except Exception as _e:
+    HAS_CV2 = False
+    CV2_ERR = str(_e)
+
 try:
     import statsmodels.api as sm
     from statsmodels.stats.outliers_infl_data import variance_inflation_factor  # older alias
@@ -146,6 +155,126 @@ def contextual_agent(section, state):
     return {"bullets": bullets, "references": IRELAND_REFS}
 
 # ==========================================================
+# Crack/Stress analyzer (robust: OpenCV -> scikit-image -> NumPy)
+# ==========================================================
+def analyze_crack_surface(np_img: np.ndarray, canny_low: int = 100, canny_high: int = 200):
+    """
+    Returns {
+        'csi': float 0..100,
+        'edge_density': float 0..1,
+        'segments': int or None,
+        'overlay': np.ndarray RGB,
+        'engine': 'opencv' | 'skimage' | 'numpy-fallback',
+        'diagnostics': dict (may include cv2_error)
+    }
+    """
+    diagnostics = {}
+    # --- Path 1: OpenCV Canny (preferred)
+    if HAS_CV2:
+        gray = cv2.cvtColor(np_img, cv2.COLOR_RGB2GRAY)
+        blur = cv2.GaussianBlur(gray, (3, 3), 0)
+        edges = cv2.Canny(blur, canny_low, canny_high)
+        edge_density = float(edges.mean() / 255.0)
+
+        # Optional skeleton/segment stats with skimage if available
+        seg_count = None
+        total_len = 0.0
+        elong_bonus = 0.0
+        if SKIMAGE_OK:
+            thin = morphology.thin(edges > 0)
+            labeled = measure.label(thin, connectivity=2)
+            props = measure.regionprops(labeled)
+            seg_count = len(props)
+            for p in props:
+                y0, x0, y1, x1 = p.bbox
+                h = max(1, y1 - y0); w = max(1, x1 - x0)
+                elong = max(h, w) / max(1.0, min(h, w))
+                total_len += p.perimeter
+                if elong > 1.0:
+                    elong_bonus += min(elong - 1.0, 20.0)
+
+        raw = 0.6 * (edge_density * 100.0) + 0.4 * (np.log1p(total_len + elong_bonus))
+        csi = float(np.clip(raw, 0, 100))
+
+        overlay = np_img.copy()
+        overlay[edges > 0] = [255, 50, 50]
+
+        return {
+            "csi": csi,
+            "edge_density": edge_density,
+            "segments": seg_count,
+            "overlay": overlay,
+            "engine": "opencv",
+            "diagnostics": diagnostics
+        }
+
+    # --- Path 2: scikit-image canny
+    if SKIMAGE_OK:
+        gray = color.rgb2gray(np_img)
+        eq = exposure.equalize_adapthist(gray, clip_limit=0.03)
+        edges = feature.canny(eq, sigma=1.6)
+        thin = morphology.thin(edges)
+        labeled = measure.label(thin, connectivity=2)
+        props = measure.regionprops(labeled)
+
+        edge_density = float(edges.mean())
+        total_len = 0.0
+        elong_bonus = 0.0
+        for p in props:
+            y0, x0, y1, x1 = p.bbox
+            h = max(1, y1 - y0); w = max(1, x1 - x0)
+            elong = max(h, w) / max(1.0, min(h, w))
+            total_len += p.perimeter
+            if elong > 1.0:
+                elong_bonus += min(elong - 1.0, 20.0)
+
+        raw = 0.6 * (edge_density * 100.0) + 0.4 * (np.log1p(total_len + elong_bonus))
+        csi = float(np.clip(raw, 0, 100))
+
+        overlay = np_img.copy()
+        overlay[edges > 0] = [255, 50, 50]
+
+        return {
+            "csi": csi,
+            "edge_density": edge_density,
+            "segments": len(props),
+            "overlay": overlay,
+            "engine": "skimage",
+            "diagnostics": diagnostics
+        }
+
+    # --- Path 3: NumPy gradient fallback (always available)
+    arr = np_img.astype(np.float32) / 255.0
+    gray = (0.299 * arr[..., 0] + 0.587 * arr[..., 1] + 0.114 * arr[..., 2]).astype(np.float32)
+    gx, gy = np.gradient(gray)
+    gm = np.hypot(gx, gy)
+    thr = float(np.percentile(gm, 88.0))
+    edges = (gm >= thr)
+
+    edge_density = float(edges.mean())
+    # Simple proxies for segments/length in fallback
+    seg_count = int(edges.sum())  # pixel count proxy
+    total_len = float(edges.sum())
+    raw = 0.6 * (edge_density * 100.0) + 0.4 * (np.log1p(total_len))
+    csi = float(np.clip(raw, 0, 100))
+
+    overlay = np_img.copy()
+    overlay[edges] = [255, 50, 50]
+
+    diagnostics["note"] = "Using NumPy fallback because OpenCV and scikit-image are unavailable."
+    if not HAS_CV2 and CV2_ERR:
+        diagnostics["cv2_error"] = CV2_ERR
+
+    return {
+        "csi": csi,
+        "edge_density": edge_density,
+        "segments": seg_count,
+        "overlay": overlay,
+        "engine": "numpy-fallback",
+        "diagnostics": diagnostics
+    }
+
+# ==========================================================
 # Page
 # ==========================================================
 st.set_page_config(page_title="Agri-Food System-of-Systems: Offline AI Prototypes", page_icon="🌾", layout="wide")
@@ -172,68 +301,67 @@ with tabs[0]:
         st.caption("References: " + " | ".join(ag["references"]))
 
 # ==========================================================
-# TAB 2 — Crack/Stress AI (original logic retained)
+# TAB 2 — Crack/Stress AI (updated to robust analyzer)
 # ==========================================================
 with tabs[1]:
     st.subheader("Crack/Stress AI (Offline Prototype)")
 
     uploaded = st.file_uploader("Upload an image (JPG/PNG)", type=["jpg", "jpeg", "png"])
 
-    def simple_csi(image_array: np.ndarray):
-        if SKIMAGE_OK:
-            gray = color.rgb2gray(image_array)
-            eq = exposure.equalize_adapthist(gray, clip_limit=0.03)
-            edges = feature.canny(eq, sigma=1.6)
-            thin = morphology.thin(edges)
-            labeled = measure.label(thin, connectivity=2)
-            props = measure.regionprops(labeled)
-            total_len = 0.0
-            elong_bonus = 0.0
-            for p in props:
-                y0, x0, y1, x1 = p.bbox
-                h = max(1, y1 - y0); w = max(1, x1 - x0)
-                elong = max(h, w) / max(1.0, min(h, w))
-                total_len += p.perimeter
-                if elong > 1.0:
-                    elong_bonus += min(elong - 1.0, 20.0)
-            edge_density = edges.mean()
-            raw = 0.6*(edge_density*100.0) + 0.4*(np.log1p(total_len + elong_bonus))
-            csi = float(np.clip(raw, 0, 100))
-            return {"csi": csi, "edge_density": float(edge_density), "segments": len(props)}
-        else:
-            arr = image_array.astype(np.float32)/255.0
-            gx = np.abs(np.gradient(arr, axis=0)).mean()
-            gy = np.abs(np.gradient(arr, axis=1)).mean()
-            csi = float(np.clip((gx + gy) * 100, 0, 100))
-            return {"csi": csi, "edge_density": float((gx+gy)/2.0), "segments": 0}
-
     results = {}
     if uploaded is not None and PIL_OK:
         img = Image.open(uploaded).convert("RGB")
-        st.image(img, caption="Input", use_container_width=True)
         np_img = np.array(img)
-        results = simple_csi(np_img)
-        csi = results["csi"]
-        st.metric("Crack Severity Index (CSI)", f"{csi:.1f} / 100")
-        st.progress(min(1.0, csi/100.0))
-        if csi < 20:
-            st.success("Low crack likelihood. Continue routine monitoring.")
-        elif csi < 50:
-            st.warning("Moderate crack-like features detected. Inspect manually and schedule maintenance.")
-        else:
-            st.error("High crack severity signal. Prioritise detailed inspection to avoid losses.")
-        with st.expander("Diagnostics"):
-            st.json(results)
+
+        # Run robust analyzer (uses OpenCV if available, else skimage, else NumPy)
+        res = analyze_crack_surface(np_img)
+        results = res
+
+        # Show input and overlay
+        c1, c2 = st.columns([1.2, 1])
+        with c1:
+            st.image(np_img, caption="Input", use_container_width=True)
+            st.image(res["overlay"], caption=f"Overlay (engine: {res['engine']})", use_container_width=True)
+        with c2:
+            csi = res["csi"]
+            st.metric("Crack Severity Index (CSI)", f"{csi:.1f} / 100")
+            st.metric("Edge density", f"{res['edge_density']:.3f}")
+            if res.get("segments") is not None:
+                st.metric("Segments (approx.)", f"{int(res['segments'])}")
+            st.progress(min(1.0, csi/100.0))
+            if csi < 20:
+                st.success("Low crack likelihood. Continue routine monitoring.")
+            elif csi < 50:
+                st.warning("Moderate crack-like features detected. Inspect manually and schedule maintenance.")
+            else:
+                st.error("High crack severity signal. Prioritise detailed inspection to avoid losses.")
+
+        # Helpful diagnostics if OpenCV isn't available
+        if res["engine"] != "opencv":
+            with st.expander("Diagnostics / How to enable OpenCV path"):
+                st.write(
+                    "OpenCV (cv2) is not available; using "
+                    f"**{res['engine']}** path. To enable Canny-based pipeline:"
+                )
+                st.code("pip install opencv-python  # desktop environments\n# or\npip install opencv-python-headless  # servers/Streamlit Cloud")
+                if CV2_ERR:
+                    st.write("cv2 import error:")
+                    st.code(CV2_ERR)
+
+        with st.expander("Raw metrics (JSON)"):
+            st.json({k: v for k, v in res.items() if k != "overlay"})
+
+        with st.expander("Contextual Agent (offline)"):
+            ag = contextual_agent("crack", {"csi": results.get("csi")})
+            st.markdown("- " + "\n- ".join(ag["bullets"]))
+            st.caption("References: " + " | ".join(ag["references"]))
+
+        st.caption("Status: Prototype — merits further validation on Irish farm imagery with domain labels.")
+
     elif uploaded is not None and not PIL_OK:
         st.warning("PIL is unavailable; cannot render the image.")
     else:
         st.info("Upload a photo to run the demo.")
-
-    with st.expander("Contextual Agent (offline)"):
-        ag = contextual_agent("crack", {"csi": results.get("csi") if results else None})
-        st.markdown("- " + "\n- ".join(ag["bullets"]))
-        st.caption("References: " + " | ".join(ag["references"]))
-    st.caption("Status: Prototype — merits further validation on Irish farm imagery with domain labels.")
 
 # ==========================================================
 # TAB 3 — ROI (enhanced)
@@ -394,7 +522,7 @@ with tabs[2]:
     # Contextual advisor on ROI tab
     with st.expander("Contextual Agent (offline)"):
         ag = contextual_agent("roi", {
-            "net_benefit": annual_net_benefit,
+            "net_benefit": annual_savings_total - ai_annual_cost - annual_maintenance,
             "payback_months": None if np.isinf(payback_months) else payback_months,
             "npv": npv,
             "sims": sims
